@@ -8,6 +8,7 @@ Packages:
 - `versions`: official game-release catalog retrieval and validation.
 - `moddb`: Vintage Story ModDB catalog, search, details, releases, and tags.
 - `modpack`: catalog-agnostic installed-mod update analysis.
+- `servers`: public Vintage Story server catalog discovery.
 
 ```go
 authClient := auth.NewClient(nil)
@@ -19,6 +20,14 @@ mods, err := catalog.Search(ctx, moddb.SearchOptions{Text: "storage", Page: 1})
 
 ```go
 releases, err := versions.NewCatalog(nil).List(ctx)
+```
+
+```go
+client := servers.NewClient(nil)
+list, err := client.List(ctx)
+for _, server := range list {
+	fmt.Println(server.Name, server.Address)
+}
 ```
 
 Licensed under GPL-3.0-only, compatible with the extracted source.
