@@ -38,6 +38,9 @@ var (
 	// ErrTooLarge is returned when the modinfo.json entry is bigger than
 	// MaxBytes.
 	ErrTooLarge = errors.New("modinfo.json is unexpectedly large")
+	// ErrInvalidContent is returned when the modinfo.json content cannot be
+	// parsed at all.
+	ErrInvalidContent = errors.New("invalid modinfo.json content")
 )
 
 // Parse reads the modinfo.json content of a mod. It tolerates a UTF-8 byte
@@ -126,7 +129,7 @@ func ReadArchive(path string) (Info, error) {
 	}
 	info, err := Parse(data)
 	if err != nil {
-		return Info{}, fmt.Errorf("parse modinfo.json: %w", err)
+		return Info{}, ErrInvalidContent
 	}
 	return info, nil
 }
