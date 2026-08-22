@@ -46,3 +46,36 @@ func TestParseServersSkipsUnnamedEntries(t *testing.T) {
 		t.Fatalf("got %#v", servers)
 	}
 }
+
+func TestParseServersCurrentCatalog(t *testing.T) {
+	root, err := html.Parse(strings.NewReader(`
+<li class="section featured" data-sid="42">
+  <a class="info" href="/s/42">
+    <div class="labels"><span><i class="fa-solid fa-user"></i> 17 / 40</span><span>1.22.7</span></div>
+    <div class="summary">A <strong>friendly</strong> current server.</div>
+    <h3>Current &amp; Friends</h3>
+  </a>
+  <a class="join button" href="vintagestoryjoin://current.example:42420">
+    <span>Join</span>
+    <i class="fa-solid fa-scroll" title="Whitelist required"></i>
+    <i class="fa-solid fa-lock" title="Password required"></i>
+  </a>
+</li>
+<li class="section" data-sid="43">
+  <a class="info"><div class="labels"><span>3 / 10</span></div><h3>Listed only</h3></a>
+</li>`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	servers := parseServers(root)
+	if len(servers) != 2 {
+		t.Fatalf("got %d servers, want 2", len(servers))
+	}
+	if got := servers[0]; got.Name != "Current & Friends" || got.Address != "current.example:42420" || got.Players != 17 || !got.Joinable || !got.RequiresWhitelist || !got.PasswordProtected || got.Description != "A friendly current server." {
+		t.Fatalf("unexpected current server: %#v", got)
+	}
+	if got := servers[1]; got.Name != "Listed only" || got.Players != 3 || got.Joinable {
+		t.Fatalf("unexpected current incomplete server: %#v", got)
+	}
+}
