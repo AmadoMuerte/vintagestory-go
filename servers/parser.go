@@ -10,14 +10,20 @@ import (
 )
 
 var (
-	playersPattern = regexp.MustCompile(`^(\d+)\s+players?$`)
-	modsPattern    = regexp.MustCompile(`^(\d+)\s+mods?\s+installed$`)
+	playersPattern        = regexp.MustCompile(`^(\d+)\s+players?$`)
+	currentPlayersPattern = regexp.MustCompile(`^(\d+)\s*/\s*\d+$`)
+	modsPattern           = regexp.MustCompile(`^(\d+)\s+mods?\s+installed$`)
 )
 
 func parseServers(root *html.Node) []Server {
 	var servers []Server
 	visit(root, func(node *html.Node) {
-		if node.Type != html.ElementNode || node.Data != "div" || attribute(node, "class") != "server" {
+		if node.Type != html.ElementNode {
+			return
+		}
+		legacyListing := node.Data == "div" && hasClass(node, "server")
+		currentListing := node.Data == "li" && hasClass(node, "section") && attribute(node, "data-sid") != ""
+		if !legacyListing && !currentListing {
 			return
 		}
 		if server, ok := parseServer(node); ok {
@@ -32,6 +38,7 @@ func parseServers(root *html.Node) []Server {
 
 func parseServer(node *html.Node) (Server, bool) {
 	server := Server{}
+	currentCatalog := node.Data == "li"
 	visit(node, func(current *html.Node) {
 		if current.Type != html.ElementNode {
 			return
@@ -41,10 +48,23 @@ func parseServer(node *html.Node) (Server, bool) {
 			if matches := playersPattern.FindStringSubmatch(nodeText(current)); len(matches) == 2 {
 				server.Players, _ = strconv.Atoi(matches[1])
 			}
+		case "span":
+			if currentCatalog && current.Parent != nil && hasClass(current.Parent, "labels") {
+				if matches := currentPlayersPattern.FindStringSubmatch(nodeText(current)); len(matches) == 2 {
+					server.Players, _ = strconv.Atoi(matches[1])
+				}
+			}
 		case "a":
 			href := attribute(current, "href")
 			if address := strings.TrimPrefix(href, "vintagestoryjoin://"); address != href {
-				server.Name, server.Address, server.Joinable = nodeText(current), address, true
+				if !currentCatalog {
+					server.Name = nodeText(current)
+				}
+				server.Address, server.Joinable = address, true
+			}
+		case "h3":
+			if currentCatalog {
+				server.Name = nodeText(current)
 			}
 		case "abbr":
 			if server.Name == "" {
@@ -60,8 +80,13 @@ func parseServer(node *html.Node) (Server, bool) {
 			if matches := modsPattern.FindStringSubmatch(attribute(current, "title")); len(matches) == 2 {
 				server.ModCount, _ = strconv.Atoi(matches[1])
 			}
+		case "i":
+			if currentCatalog {
+				server.RequiresWhitelist = server.RequiresWhitelist || hasClass(current, "fa-scroll")
+				server.PasswordProtected = server.PasswordProtected || hasClass(current, "fa-lock")
+			}
 		case "div":
-			if attribute(current, "class") == "serverdesc" {
+			if hasClass(current, "serverdesc") || currentCatalog && hasClass(current, "summary") {
 				server.Description = nodeText(current)
 			}
 		}
@@ -69,6 +94,15 @@ func parseServer(node *html.Node) (Server, bool) {
 	server.Name = strings.TrimSpace(server.Name)
 	server.Address = strings.TrimSpace(server.Address)
 	return server, server.Name != ""
+}
+
+func hasClass(node *html.Node, class string) bool {
+	for value := range strings.FieldsSeq(attribute(node, "class")) {
+		if value == class {
+			return true
+		}
+	}
+	return false
 }
 
 func visit(node *html.Node, fn func(*html.Node)) {
