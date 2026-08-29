@@ -2,7 +2,8 @@ package servers
 
 import (
 	"errors"
-	"fmt"
+
+	"github.com/AmadoMuerte/vintagestory-go/vshttp"
 )
 
 var (
@@ -12,13 +13,22 @@ var (
 	ErrInvalidCatalog = errors.New("invalid public server catalog")
 )
 
-// HTTPError identifies a non-success response from the public server catalog.
-type HTTPError struct {
-	StatusCode int
-}
+// HTTPError is kept for source compatibility. New code should use
+// errors.As with *vshttp.APIError.
+type HTTPError = vshttp.APIError
 
-func (err *HTTPError) Error() string {
-	return fmt.Sprintf("public server catalog returned HTTP %d", err.StatusCode)
+// legacy annotates a vshttp error with the matching package sentinel so
+// errors.Is keeps working for ErrUnavailable and ErrInvalidCatalog.
+func legacy(err error) error {
+	var apiErr *vshttp.APIError
+	if !errors.As(err, &apiErr) || apiErr.Legacy != nil {
+		return err
+	}
+	switch apiErr.Kind {
+	case vshttp.KindInvalidJSON, vshttp.KindInvalidResponse, vshttp.KindResponseTooLarge:
+		apiErr.Legacy = ErrInvalidCatalog
+	default:
+		apiErr.Legacy = ErrUnavailable
+	}
+	return apiErr
 }
-
-func (err *HTTPError) Unwrap() error { return ErrUnavailable }

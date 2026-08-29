@@ -2,9 +2,15 @@ package versions
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
+
+	"github.com/AmadoMuerte/vintagestory-go/vshttp"
 )
 
 func TestCatalogMappingAndInvalidRelease(t *testing.T) {
@@ -29,4 +35,52 @@ func TestUnsupportedPlatform(t *testing.T) {
 	if e != nil || len(items) != 0 {
 		t.Fatalf("%v %#v", e, items)
 	}
+}
+
+func TestFetchFailuresKeepCause(t *testing.T) {
+	t.Run("status", func(t *testing.T) {
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "no", 500)
+		}))
+		defer s.Close()
+		c := NewCatalogForPlatform(s.Client(), s.URL, "linux", "amd64")
+		_, err := c.List(context.Background())
+		if !errors.Is(err, ErrUnavailable) || !errors.Is(err, vshttp.ErrServer) {
+			t.Fatalf("%v", err)
+		}
+		var apiErr *vshttp.APIError
+		if !errors.As(err, &apiErr) || apiErr.StatusCode != 500 || apiErr.Kind != vshttp.KindServerError {
+			t.Fatalf("%#v", err)
+		}
+	})
+	t.Run("malformed json", func(t *testing.T) {
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, `{"1.22.0":`)
+		}))
+		defer s.Close()
+		c := NewCatalogForPlatform(s.Client(), s.URL, "linux", "amd64")
+		_, err := c.List(context.Background())
+		if !errors.Is(err, ErrInvalidResponse) || !strings.Contains(err.Error(), "unexpected end") {
+			t.Fatalf("%v", err)
+		}
+	})
+	t.Run("retry then success", func(t *testing.T) {
+		var attempts atomic.Int32
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			if attempts.Add(1) == 1 {
+				http.Error(w, "no", 503)
+				return
+			}
+			_, _ = io.WriteString(w, `{}`)
+		}))
+		defer s.Close()
+		c := NewCatalogForPlatform(s.Client(), s.URL, "linux", "amd64")
+		c.SetRetryPolicy(vshttp.RetryPolicy{MaxAttempts: 3, BaseDelay: 1e6, MaxDelay: 5e6})
+		if _, err := c.List(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if attempts.Load() != 2 {
+			t.Fatalf("attempts = %d", attempts.Load())
+		}
+	})
 }

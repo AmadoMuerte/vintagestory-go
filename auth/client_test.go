@@ -2,11 +2,16 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
+
+	"github.com/AmadoMuerte/vintagestory-go/vshttp"
 )
 
 func TestLoginAndTOTP(t *testing.T) {
@@ -54,5 +59,48 @@ func TestValidateAndServerFailure(t *testing.T) {
 	bad.Close()
 	if !errors.Is(e, ErrServer) {
 		t.Fatalf("got %v", e)
+	}
+}
+
+func TestRootCausePreserved(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"valid":"tru`)
+	}))
+	defer s.Close()
+	_, _, err := NewClientWithURLs(s.Client(), s.URL, s.URL).Login(context.Background(), "a", "b", "", "")
+	if !errors.Is(err, ErrInvalidAuthReply) {
+		t.Fatalf("legacy sentinel: %v", err)
+	}
+	var syntaxErr *json.SyntaxError
+	if !errors.As(err, &syntaxErr) {
+		t.Fatalf("json root cause lost: %v", err)
+	}
+	var apiErr *vshttp.APIError
+	if !errors.As(err, &apiErr) || apiErr.Kind != vshttp.KindInvalidJSON {
+		t.Fatalf("%#v", err)
+	}
+}
+
+func TestNetworkErrorAndNoPostRetry(t *testing.T) {
+	var attempts atomic.Int32
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
+		http.Error(w, "no", http.StatusServiceUnavailable)
+	}))
+	url := s.URL
+	s.Close() // connection refused from now on
+	_, _, err := NewClientWithURLs(s.Client(), url, url).Login(context.Background(), "a", "b", "", "")
+	if !errors.Is(err, ErrNetwork) {
+		t.Fatalf("got %v", err)
+	}
+	var apiErr *vshttp.APIError
+	if !errors.As(err, &apiErr) || apiErr.Kind != vshttp.KindNetwork {
+		t.Fatalf("%#v", err)
+	}
+	if strings.Contains(err.Error(), "a@") || strings.Contains(err.Error(), "password") {
+		t.Fatalf("credentials leaked: %v", err)
+	}
+	if attempts.Load() > 1 {
+		t.Fatalf("POST must not be retried: %d", attempts.Load())
 	}
 }

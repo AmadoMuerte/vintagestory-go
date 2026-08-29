@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"testing"
+
+	"github.com/AmadoMuerte/vintagestory-go/vshttp"
 )
 
 func TestClientUsesUserAgentAndPrimaryFeed(t *testing.T) {
@@ -58,10 +60,34 @@ func TestClientReportsBothFeedsUnavailable(t *testing.T) {
 	}))
 	defer server.Close()
 	client := NewClient(server.Client(), "")
+	client.SetRetryPolicy(vshttp.RetryPolicy{MaxAttempts: 1})
 	client.primaryURL = server.URL + "/primary"
 	client.fallbackURL = server.URL + "/fallback"
 	_, err := client.List(context.Background())
 	if !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("got %v", err)
+	}
+	// Both per-feed failures keep their structured details.
+	var apiErr *vshttp.APIError
+	if !errors.As(err, &apiErr) || apiErr.Kind != vshttp.KindServerError || apiErr.StatusCode != 503 {
+		t.Fatalf("%#v", err)
+	}
+}
+
+func TestFeedTooLargeIsExplicit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		_, _ = response.Write(make([]byte, maxResponseBytes+1))
+	}))
+	defer server.Close()
+	client := NewClient(server.Client(), "")
+	client.SetRetryPolicy(vshttp.RetryPolicy{MaxAttempts: 1})
+	client.primaryURL = server.URL
+	client.fallbackURL = server.URL
+	_, err := client.List(context.Background())
+	if !errors.Is(err, ErrInvalidFeed) {
+		t.Fatalf("legacy sentinel: %v", err)
+	}
+	if !errors.Is(err, vshttp.ErrResponseTooLarge) {
+		t.Fatalf("expected explicit too-large: %v", err)
 	}
 }

@@ -63,4 +63,8 @@ type SearchResult struct {
 	Items                                  []Mod
 	Page, PageSize, TotalItems, TotalPages int
 	HasNext                                bool
+	// Warning is non-nil when the result is degraded but usable: the
+	// catalog was served from a stale cache (matches ErrStale) or some
+	// game-version detail lookups failed and results may be incomplete.
+	Warning error
 }

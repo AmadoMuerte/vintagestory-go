@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/AmadoMuerte/vintagestory-go/vshttp"
 )
 
 const catalogFixture = `<div class="server"><b>2 players</b><a href="vintagestoryjoin://one.test:42420">One</a></div><div class="server"><b>8 players</b><a href="vintagestoryjoin://two.test:42420">Two</a></div>`
@@ -111,5 +113,23 @@ func TestListHonorsCanceledContext(t *testing.T) {
 	_, err := NewClientWithURL(server.Client(), server.URL).List(ctx)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("got %v", err)
+	}
+}
+
+func TestOversizedCatalogIsExplicit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, strings.Repeat(" ", maxResponseBytes+1))
+	}))
+	defer server.Close()
+	_, err := NewClientWithURL(server.Client(), server.URL).List(context.Background())
+	if !errors.Is(err, ErrInvalidCatalog) {
+		t.Fatalf("legacy sentinel: %v", err)
+	}
+	if !errors.Is(err, vshttp.ErrResponseTooLarge) {
+		t.Fatalf("expected explicit too-large error: %v", err)
+	}
+	var apiErr *vshttp.APIError
+	if !errors.As(err, &apiErr) || apiErr.Kind != vshttp.KindResponseTooLarge || apiErr.Limit != maxResponseBytes {
+		t.Fatalf("%#v", err)
 	}
 }

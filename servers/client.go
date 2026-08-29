@@ -1,13 +1,14 @@
 package servers
 
 import (
+	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"net/http"
 	"sync"
 	"time"
 
+	"github.com/AmadoMuerte/vintagestory-go/vshttp"
 	"golang.org/x/net/html"
 )
 
@@ -22,19 +23,20 @@ const (
 type Client struct {
 	httpClient *http.Client
 	endpoint   string
+	retry      vshttp.RetryPolicy
 
 	mu        sync.Mutex
 	servers   []Server
 	fetchedAt time.Time
 }
 
-// NewClient creates a public server catalog client. A nil client uses a
-// 15-second timeout.
+// NewClient creates a public server catalog client. A nil client uses
+// bounded default timeouts.
 func NewClient(httpClient *http.Client) *Client {
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 15 * time.Second}
+		httpClient = vshttp.DefaultClient(15 * time.Second)
 	}
-	return &Client{httpClient: httpClient, endpoint: OfficialCatalogURL}
+	return &Client{httpClient: httpClient, endpoint: OfficialCatalogURL, retry: vshttp.DefaultRetryPolicy()}
 }
 
 // NewClientWithURL creates a client with an explicit catalog endpoint. It is
@@ -45,8 +47,12 @@ func NewClientWithURL(httpClient *http.Client, endpoint string) *Client {
 	return client
 }
 
+// SetRetryPolicy overrides the retry policy used for the catalog request.
+func (c *Client) SetRetryPolicy(p vshttp.RetryPolicy) { c.retry = p }
+
 // List returns public server listings sorted by player count, highest first.
-// Successful results are cached for five minutes.
+// Successful results are cached for five minutes and concurrent callers
+// share a single fetch. A failed refresh never replaces a valid cache.
 func (c *Client) List(ctx context.Context) ([]Server, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -55,26 +61,26 @@ func (c *Client) List(ctx context.Context) ([]Server, error) {
 		return append([]Server(nil), c.servers...), nil
 	}
 
+	const op = "servers: list catalog"
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint, nil)
 	if err != nil {
-		return nil, fmt.Errorf("create public server catalog request: %w", err)
+		return nil, legacy(&vshttp.APIError{Operation: op, Method: http.MethodGet, Endpoint: c.endpoint, Kind: vshttp.KindValidation, Cause: err})
 	}
-	response, err := c.httpClient.Do(request)
+	response, body, err := vshttp.Do(ctx, c.httpClient, c.retry, op, request, maxResponseBytes)
 	if err != nil {
-		return nil, fmt.Errorf("fetch public server catalog: %w: %w", ErrUnavailable, err)
+		return nil, legacy(err)
 	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		return nil, &HTTPError{StatusCode: response.StatusCode}
+	if err := vshttp.CheckStatus(op, request, response); err != nil {
+		return nil, legacy(err)
 	}
 
-	root, err := html.Parse(io.LimitReader(response.Body, maxResponseBytes))
+	root, err := html.Parse(bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("parse public server catalog: %w: %w", ErrInvalidCatalog, err)
+		return nil, legacy(&vshttp.APIError{Operation: op, Method: http.MethodGet, Endpoint: c.endpoint, StatusCode: response.StatusCode, ContentType: response.Header.Get("Content-Type"), Kind: vshttp.KindInvalidResponse, Cause: fmt.Errorf("parse catalog HTML: %w", err)})
 	}
 	servers := parseServers(root)
 	if len(servers) == 0 {
-		return nil, fmt.Errorf("public server catalog contained no server listings: %w", ErrInvalidCatalog)
+		return nil, legacy(&vshttp.APIError{Operation: op, Method: http.MethodGet, Endpoint: c.endpoint, StatusCode: response.StatusCode, ContentType: response.Header.Get("Content-Type"), Kind: vshttp.KindInvalidResponse, Cause: fmt.Errorf("catalog contained no server listings")})
 	}
 	c.servers = append([]Server(nil), servers...)
 	c.fetchedAt = time.Now()

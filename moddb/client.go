@@ -3,8 +3,8 @@ package moddb
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"sort"
@@ -12,6 +12,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/AmadoMuerte/vintagestory-go/vshttp"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -22,25 +25,30 @@ const (
 )
 
 // Client retrieves and locally searches the Vintage Story ModDB catalog.
+// A Client may be used concurrently by multiple goroutines.
 type Client struct {
 	httpClient *http.Client
 	baseURL    string
-	mu         sync.RWMutex
-	catalog    []Mod
-	catalogAt  time.Time
-	details    map[string]cachedDetails
+	retry      vshttp.RetryPolicy
+
+	mu        sync.RWMutex
+	catalog   []Mod
+	catalogAt time.Time
+	details   map[string]cachedDetails
+	inflight  singleflight.Group
 }
 type cachedDetails struct {
 	value     ModDetails
 	fetchedAt time.Time
 }
 
-// NewClient creates a ModDB client. A nil client uses a 30 second timeout.
+// NewClient creates a ModDB client. A nil client uses bounded default
+// timeouts suitable for unstable networks.
 func NewClient(httpClient *http.Client) *Client {
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 30 * time.Second}
+		httpClient = vshttp.DefaultClient(30 * time.Second)
 	}
-	return &Client{httpClient: httpClient, baseURL: DefaultBaseURL, details: map[string]cachedDetails{}}
+	return &Client{httpClient: httpClient, baseURL: DefaultBaseURL, retry: vshttp.DefaultRetryPolicy(), details: map[string]cachedDetails{}}
 }
 
 // NewClientWithURL creates a client against an explicit API base URL.
@@ -49,6 +57,9 @@ func NewClientWithURL(httpClient *http.Client, baseURL string) *Client {
 	c.baseURL = strings.TrimRight(baseURL, "/")
 	return c
 }
+
+// SetRetryPolicy overrides the retry policy used for GET requests.
+func (c *Client) SetRetryPolicy(p vshttp.RetryPolicy) { c.retry = p }
 
 type modsResponse struct {
 	StatusCode string       `json:"statuscode"`
@@ -86,18 +97,29 @@ type apiRelease struct {
 	ModVersion, Created, Changelog string
 }
 
-// List returns all catalog mods, excluding non-mod assets. Results are cached for ten minutes.
+// List returns all catalog mods, excluding non-mod assets. Results are
+// cached for ten minutes and concurrent calls share a single upstream
+// request.
+//
+// When a refresh fails but a previous catalog is still cached, List returns
+// the stale data together with an error matching ErrStale: callers that
+// prefer availability over freshness may use the data, callers that do not
+// can keep treating the error as fatal.
 func (c *Client) List(ctx context.Context) ([]Mod, error) {
 	items, e := c.list(ctx)
 	return append([]Mod(nil), items...), e
 }
 
-// Search filters, sorts, and pages the catalog locally. Game-version filtering loads details for a bounded candidate set.
+// Search filters, sorts, and pages the catalog locally. Game-version
+// filtering loads details for a bounded candidate set. Partial failures of
+// those detail lookups are reported via SearchResult.Warning instead of
+// silently dropping results.
 func (c *Client) Search(ctx context.Context, q SearchOptions) (SearchResult, error) {
-	items, e := c.list(ctx)
-	if e != nil {
-		return SearchResult{}, e
+	items, err := c.list(ctx)
+	if err != nil && !errors.Is(err, ErrStale) {
+		return SearchResult{}, err
 	}
+	warning := err
 	filtered := make([]Mod, 0, len(items))
 	text := strings.ToLower(strings.TrimSpace(q.Text))
 	for _, m := range items {
@@ -117,7 +139,14 @@ func (c *Client) Search(ctx context.Context, q SearchOptions) (SearchResult, err
 	}
 	sortMods(filtered, q.Sort, text != "")
 	if q.GameVersion != "" {
-		filtered = c.enrichCompatible(ctx, filtered, q.GameVersion, q.PageSize)
+		enriched, enrichErr := c.enrichCompatible(ctx, filtered, q.GameVersion, q.PageSize)
+		if enrichErr != nil && errors.Is(enrichErr, context.Canceled) {
+			return SearchResult{}, enrichErr
+		}
+		if enrichErr != nil && warning == nil {
+			warning = enrichErr
+		}
+		filtered = enriched
 	}
 	page := q.Page
 	if page < 1 {
@@ -136,14 +165,16 @@ func (c *Client) Search(ctx context.Context, q SearchOptions) (SearchResult, err
 	if end > total {
 		end = total
 	}
-	return SearchResult{Items: append([]Mod(nil), filtered[start:end]...), Page: page, PageSize: size, TotalItems: total, TotalPages: (total + size - 1) / size, HasNext: end < total}, nil
+	return SearchResult{Items: append([]Mod(nil), filtered[start:end]...), Page: page, PageSize: size, TotalItems: total, TotalPages: (total + size - 1) / size, HasNext: end < total, Warning: warning}, nil
 }
 
-// ListTags returns case-insensitive catalog tags with usage counts.
+// ListTags returns case-insensitive catalog tags with usage counts. The
+// upstream /api/tags endpoint carries no usage counts, so tags are counted
+// from the cached catalog instead of issuing a separate heavy request.
 func (c *Client) ListTags(ctx context.Context) ([]Tag, error) {
-	items, e := c.list(ctx)
-	if e != nil {
-		return nil, e
+	items, err := c.list(ctx)
+	if err != nil && !errors.Is(err, ErrStale) {
+		return nil, err
 	}
 	by := map[string]*Tag{}
 	for _, m := range items {
@@ -160,8 +191,13 @@ func (c *Client) ListTags(ctx context.Context) ([]Tag, error) {
 		out = append(out, *t)
 	}
 	sort.Slice(out, func(i, j int) bool { return strings.ToLower(out[i].Name) < strings.ToLower(out[j].Name) })
-	return out, nil
+	return out, err
 }
+
+// list returns the catalog, fetching it through a single shared flight on
+// cache miss. On refresh failure a stale cache is returned together with an
+// error wrapping ErrStale; the stale cache is never replaced by a failed
+// or partial response.
 func (c *Client) list(ctx context.Context) ([]Mod, error) {
 	c.mu.RLock()
 	if len(c.catalog) > 0 && time.Since(c.catalogAt) < catalogCacheTTL {
@@ -169,13 +205,40 @@ func (c *Client) list(ctx context.Context) ([]Mod, error) {
 		c.mu.RUnlock()
 		return out, nil
 	}
+	stale := append([]Mod(nil), c.catalog...)
 	c.mu.RUnlock()
+
+	result := c.inflight.DoChan("catalog", func() (any, error) {
+		// Detach from the caller's cancellation: the shared fetch must
+		// survive the first caller leaving so all waiters get a result
+		// and the cache still gets populated. Bounded by client timeouts.
+		items, err := c.fetchCatalog(context.WithoutCancel(ctx))
+		if err != nil && len(stale) > 0 {
+			return stale, fmt.Errorf("%w: %w", ErrStale, err)
+		}
+		return items, err
+	})
+	select {
+	case r := <-result:
+		if r.Err != nil {
+			items, _ := r.Val.([]Mod)
+			return items, r.Err
+		}
+		items, _ := r.Val.([]Mod)
+		return append([]Mod(nil), items...), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (c *Client) fetchCatalog(ctx context.Context) ([]Mod, error) {
+	endpoint := c.baseURL + "/mods"
 	var r modsResponse
-	if e := c.getJSON(ctx, c.baseURL+"/mods", &r); e != nil {
+	if e := c.getJSON(ctx, "moddb: list catalog", endpoint, &r); e != nil {
 		return nil, e
 	}
 	if r.StatusCode != "200" {
-		return nil, ErrUnavailable
+		return nil, legacy(apiStatusError("moddb: list catalog", endpoint, r.StatusCode))
 	}
 	out := make([]Mod, 0, len(r.Mods))
 	for _, x := range r.Mods {
@@ -202,7 +265,9 @@ func (c *Client) list(ctx context.Context) ([]Mod, error) {
 	return out, nil
 }
 
-// Get returns detailed metadata for a numeric ID or ModDB slug. Results are cached for thirty minutes.
+// Get returns detailed metadata for a numeric ID or ModDB slug. Results are
+// cached for thirty minutes and concurrent calls for the same mod share a
+// single upstream request.
 func (c *Client) Get(ctx context.Context, id string) (ModDetails, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
@@ -214,12 +279,36 @@ func (c *Client) Get(ctx context.Context, id string) (ModDetails, error) {
 		return x.value, nil
 	}
 	c.mu.RUnlock()
+
+	result := c.inflight.DoChan("mod:"+id, func() (any, error) {
+		return c.fetchDetails(context.WithoutCancel(ctx), id)
+	})
+	select {
+	case r := <-result:
+		if r.Err != nil {
+			return ModDetails{}, r.Err
+		}
+		return r.Val.(ModDetails), nil
+	case <-ctx.Done():
+		return ModDetails{}, ctx.Err()
+	}
+}
+
+func (c *Client) fetchDetails(ctx context.Context, id string) (ModDetails, error) {
+	endpoint := c.baseURL + "/mod/" + url.PathEscape(id)
 	var r modResponse
-	if e := c.getJSON(ctx, c.baseURL+"/mod/"+url.PathEscape(id), &r); e != nil {
+	if e := c.getJSON(ctx, "moddb: get mod details", endpoint, &r); e != nil {
 		return ModDetails{}, e
 	}
 	if r.StatusCode != "200" || r.Mod.ModID == 0 {
-		return ModDetails{}, ErrNotFound
+		return ModDetails{}, &vshttp.APIError{
+			Operation: "moddb: get mod details",
+			Method:    "GET",
+			Endpoint:  endpoint,
+			Kind:      vshttp.KindNotFound,
+			Legacy:    ErrNotFound,
+			Cause:     fmt.Errorf("moddb API returned statuscode %q", r.StatusCode),
+		}
 	}
 	d := mapDetails(r.Mod)
 	c.mu.Lock()
@@ -258,7 +347,11 @@ func mapDetails(x apiDetail) ModDetails {
 	}
 	return d
 }
-func (c *Client) enrichCompatible(ctx context.Context, items []Mod, game string, size int) []Mod {
+
+// enrichCompatible resolves game-version support for up to six pages of
+// candidates. Individual lookup failures no longer vanish: the first
+// failure is returned so the caller can surface a partial-results warning.
+func (c *Client) enrichCompatible(ctx context.Context, items []Mod, game string, size int) ([]Mod, error) {
 	if size < 1 {
 		size = 24
 	}
@@ -270,8 +363,9 @@ func (c *Client) enrichCompatible(ctx context.Context, items []Mod, game string,
 		limit = len(items)
 	}
 	type result struct {
-		i int
-		d ModDetails
+		i   int
+		d   ModDetails
+		err error
 	}
 	jobs := make(chan int)
 	results := make(chan result, limit)
@@ -285,9 +379,8 @@ func (c *Client) enrichCompatible(ctx context.Context, items []Mod, game string,
 		go func() {
 			defer wg.Done()
 			for i := range jobs {
-				if d, e := c.Get(ctx, items[i].ID); e == nil {
-					results <- result{i, d}
-				}
+				d, e := c.Get(ctx, items[i].ID)
+				results <- result{i, d, e}
 			}
 		}()
 	}
@@ -307,8 +400,20 @@ func (c *Client) enrichCompatible(ctx context.Context, items []Mod, game string,
 		close(results)
 	}()
 	by := map[int]ModDetails{}
+	var firstErr error
+	failures := 0
 	for x := range results {
+		if x.err != nil {
+			failures++
+			if firstErr == nil {
+				firstErr = x.err
+			}
+			continue
+		}
 		by[x.i] = x.d
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	out := []Mod{}
 	for i := 0; i < limit; i++ {
@@ -318,29 +423,19 @@ func (c *Client) enrichCompatible(ctx context.Context, items []Mod, game string,
 			out = append(out, m)
 		}
 	}
-	return out
+	if firstErr != nil {
+		return out, fmt.Errorf("moddb: game version enrichment: %d of %d lookups failed, first failure: %w", failures, limit, firstErr)
+	}
+	return out, nil
 }
-func (c *Client) getJSON(ctx context.Context, endpoint string, target any) error {
+
+func (c *Client) getJSON(ctx context.Context, op, endpoint string, target any) error {
 	req, e := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if e != nil {
-		return fmt.Errorf("create mod catalog request: %w", ErrUnavailable)
+		return &vshttp.APIError{Operation: op, Method: http.MethodGet, Endpoint: endpoint, Kind: vshttp.KindValidation, Legacy: ErrUnavailable, Cause: e}
 	}
 	req.Header.Set("Accept", "application/json")
-	resp, e := c.httpClient.Do(req)
-	if e != nil {
-		return fmt.Errorf("request mod catalog: %w", ErrUnavailable)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
-		return ErrNotFound
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return &HTTPError{resp.StatusCode, ErrUnavailable}
-	}
-	if e := json.NewDecoder(io.LimitReader(resp.Body, maxReplyBytes)).Decode(target); e != nil {
-		return fmt.Errorf("decode mod catalog response: %w", ErrInvalidResponse)
-	}
-	return nil
+	return legacy(vshttp.FetchJSON(ctx, c.httpClient, c.retry, op, req, maxReplyBytes, target))
 }
 func matchesText(m Mod, q string) bool {
 	return strings.Contains(strings.ToLower(strings.Join([]string{m.ID, m.Slug, m.Name, m.AuthorName, m.Summary, strings.Join(m.Tags, " ")}, " ")), q)

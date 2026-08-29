@@ -3,7 +3,8 @@ package auth
 
 import (
 	"errors"
-	"fmt"
+
+	"github.com/AmadoMuerte/vintagestory-go/vshttp"
 )
 
 var (
@@ -18,16 +19,25 @@ var (
 	ErrUnknown            = errors.New("unknown auth error")
 )
 
-// InvalidResponseError describes a malformed or oversized API response.
-type InvalidResponseError struct {
-	StatusCode  int
-	ContentType string
-	BodySize    int
-	Cause       error
-}
+// InvalidResponseError is kept for source compatibility. New code should
+// use errors.As with *vshttp.APIError, which preserves the original cause
+// (JSON syntax error, truncated body, size limit, ...).
+type InvalidResponseError = vshttp.APIError
 
-func (err *InvalidResponseError) Error() string {
-	return fmt.Sprintf("unexpected authentication response: status=%d content-type=%q size=%d", err.StatusCode, err.ContentType, err.BodySize)
+// legacy annotates a vshttp error with the matching package sentinel so
+// errors.Is keeps working for ErrNetwork, ErrServer and ErrInvalidAuthReply.
+func legacy(err error) error {
+	var apiErr *vshttp.APIError
+	if !errors.As(err, &apiErr) || apiErr.Legacy != nil {
+		return err
+	}
+	switch apiErr.Kind {
+	case vshttp.KindInvalidJSON, vshttp.KindInvalidResponse, vshttp.KindResponseTooLarge, vshttp.KindBodyRead:
+		apiErr.Legacy = ErrInvalidAuthReply
+	case vshttp.KindNetwork, vshttp.KindTimeout, vshttp.KindDNS, vshttp.KindTLS, vshttp.KindCanceled, vshttp.KindValidation:
+		apiErr.Legacy = ErrNetwork
+	default:
+		apiErr.Legacy = ErrServer
+	}
+	return apiErr
 }
-
-func (err *InvalidResponseError) Unwrap() error { return err.Cause }

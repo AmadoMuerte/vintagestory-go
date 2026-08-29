@@ -4,10 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/AmadoMuerte/vintagestory-go/vshttp"
 )
 
 const (
@@ -23,21 +24,20 @@ type Client struct {
 	primaryURL  string
 	fallbackURL string
 	userAgent   string
+	retry       vshttp.RetryPolicy
 }
 
-// NewClient creates an official news client. A nil client uses a 15-second
-// timeout. An empty user agent uses "vintagestory-go".
+// NewClient creates an official news client. A nil client uses bounded
+// default timeouts. An empty user agent uses "vintagestory-go".
 func NewClient(httpClient *http.Client, userAgent string) *Client {
 	if httpClient == nil {
-		httpClient = &http.Client{
-			Timeout: 15 * time.Second,
-			CheckRedirect: func(request *http.Request, via []*http.Request) error {
-				if len(via) >= 5 || request.URL.Scheme != "https" ||
-					!strings.EqualFold(request.URL.Hostname(), "www.vintagestory.at") {
-					return errors.New("official news redirected to an untrusted URL")
-				}
-				return nil
-			},
+		httpClient = vshttp.DefaultClient(15 * time.Second)
+		httpClient.CheckRedirect = func(request *http.Request, via []*http.Request) error {
+			if len(via) >= 5 || request.URL.Scheme != "https" ||
+				!strings.EqualFold(request.URL.Hostname(), "www.vintagestory.at") {
+				return errors.New("official news redirected to an untrusted URL")
+			}
+			return nil
 		}
 	}
 	if strings.TrimSpace(userAgent) == "" {
@@ -48,8 +48,12 @@ func NewClient(httpClient *http.Client, userAgent string) *Client {
 		primaryURL:  OfficialFeedURL,
 		fallbackURL: OfficialFallbackFeedURL,
 		userAgent:   userAgent,
+		retry:       vshttp.DefaultRetryPolicy(),
 	}
 }
+
+// SetRetryPolicy overrides the retry policy used for feed requests.
+func (client *Client) SetRetryPolicy(p vshttp.RetryPolicy) { client.retry = p }
 
 // List returns official posts sorted newest-first. The forum feed is tried
 // only when the primary blog feed cannot provide usable entries.
@@ -57,6 +61,9 @@ func (client *Client) List(ctx context.Context) ([]Item, error) {
 	items, primaryErr := client.fetch(ctx, client.primaryURL)
 	if primaryErr == nil {
 		return items, nil
+	}
+	if ctx.Err() != nil {
+		return nil, primaryErr
 	}
 	items, fallbackErr := client.fetch(ctx, client.fallbackURL)
 	if fallbackErr == nil {
@@ -66,26 +73,23 @@ func (client *Client) List(ctx context.Context) ([]Item, error) {
 }
 
 func (client *Client) fetch(ctx context.Context, endpoint string) ([]Item, error) {
+	op := "news: fetch feed"
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return nil, fmt.Errorf("create official news request: %w", err)
+		return nil, legacy(&vshttp.APIError{Operation: op, Method: http.MethodGet, Endpoint: endpoint, Kind: vshttp.KindValidation, Cause: err})
 	}
 	request.Header.Set("Accept", "application/rss+xml, application/xml;q=0.9")
 	request.Header.Set("User-Agent", client.userAgent)
-	response, err := client.httpClient.Do(request)
+	response, body, err := vshttp.Do(ctx, client.httpClient, client.retry, op, request, maxResponseBytes)
 	if err != nil {
-		return nil, fmt.Errorf("fetch official news: %w", err)
+		return nil, legacy(err)
 	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		return nil, &HTTPError{StatusCode: response.StatusCode}
+	if err := vshttp.CheckStatus(op, request, response); err != nil {
+		return nil, legacy(err)
 	}
-	body, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
+	items, err := parse(body)
 	if err != nil {
-		return nil, fmt.Errorf("read official news: %w", err)
+		return nil, legacy(&vshttp.APIError{Operation: op, Method: http.MethodGet, Endpoint: endpoint, StatusCode: response.StatusCode, ContentType: response.Header.Get("Content-Type"), Kind: vshttp.KindInvalidResponse, BodySize: int64(len(body)), Cause: err})
 	}
-	if len(body) > maxResponseBytes {
-		return nil, fmt.Errorf("official news feed exceeds %d bytes: %w", maxResponseBytes, ErrInvalidFeed)
-	}
-	return parse(body)
+	return items, nil
 }

@@ -3,9 +3,7 @@ package versions
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"path"
@@ -16,6 +14,8 @@ import (
 	"sync"
 	"time"
 	"unicode"
+
+	"github.com/AmadoMuerte/vintagestory-go/vshttp"
 )
 
 const OfficialCatalogURL = "https://api.vintagestory.at/stable-unstable.json"
@@ -40,17 +40,19 @@ type catalogFile struct {
 type Catalog struct {
 	client                           *http.Client
 	endpoint, platform, architecture string
+	retry                            vshttp.RetryPolicy
 	cacheMu                          sync.Mutex
 	cachedAt                         time.Time
 	cached                           []Release
 }
 
-// NewCatalog creates a catalog for the current platform. A nil client uses a 20 second timeout.
+// NewCatalog creates a catalog for the current platform. A nil client uses
+// bounded default timeouts.
 func NewCatalog(client *http.Client) *Catalog {
 	if client == nil {
-		client = &http.Client{Timeout: 20 * time.Second}
+		client = vshttp.DefaultClient(20 * time.Second)
 	}
-	return &Catalog{client: client, endpoint: OfficialCatalogURL, platform: runtime.GOOS, architecture: runtime.GOARCH}
+	return &Catalog{client: client, endpoint: OfficialCatalogURL, retry: vshttp.DefaultRetryPolicy(), platform: runtime.GOOS, architecture: runtime.GOARCH}
 }
 
 // NewCatalogForPlatform creates a catalog with an explicit endpoint and target platform.
@@ -60,32 +62,44 @@ func NewCatalogForPlatform(client *http.Client, endpoint, platform, architecture
 	return c
 }
 
-// List returns supported releases sorted newest-first. Results are cached for five minutes.
+// SetRetryPolicy overrides the retry policy used for the catalog request.
+func (c *Catalog) SetRetryPolicy(p vshttp.RetryPolicy) { c.retry = p }
+
+// List returns supported releases sorted newest-first. Results are cached
+// for five minutes; concurrent callers share a single fetch. A failed
+// refresh never replaces a previously cached catalog.
 func (c *Catalog) List(ctx context.Context) ([]Release, error) {
 	c.cacheMu.Lock()
+	defer c.cacheMu.Unlock()
 	if len(c.cached) > 0 && time.Since(c.cachedAt) < 5*time.Minute {
-		r := append([]Release(nil), c.cached...)
-		c.cacheMu.Unlock()
-		return r, nil
+		return append([]Release(nil), c.cached...), nil
 	}
-	c.cacheMu.Unlock()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint, nil)
+	result, err := c.fetch(ctx)
 	if err != nil {
 		return nil, err
+	}
+	c.cached = append([]Release(nil), result...)
+	c.cachedAt = time.Now()
+	return result, nil
+}
+
+func (c *Catalog) fetch(ctx context.Context) ([]Release, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint, nil)
+	if err != nil {
+		return nil, legacy(&vshttp.APIError{Operation: "versions: list catalog", Method: http.MethodGet, Endpoint: c.endpoint, Kind: vshttp.KindValidation, Cause: err})
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "vintagestory-go")
-	resp, err := c.client.Do(req)
+	resp, body, err := vshttp.Do(ctx, c.client, c.retry, "versions: list catalog", req, 8<<20)
 	if err != nil {
-		return nil, err
+		return nil, legacy(err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("version catalog returned HTTP %d", resp.StatusCode)
+	if err := vshttp.CheckStatus("versions: list catalog", req, resp); err != nil {
+		return nil, legacy(err)
 	}
 	var payload map[string]map[string]catalogFile
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&payload); err != nil {
-		return nil, fmt.Errorf("decode version catalog: %w", err)
+	if err := vshttp.DecodeJSON("versions: list catalog", req, resp, body, &payload); err != nil {
+		return nil, legacy(err)
 	}
 	key, arch, ok := distributionFor(c.platform, c.architecture)
 	if !ok {
@@ -100,10 +114,6 @@ func (c *Catalog) List(ctx context.Context) ([]Release, error) {
 		}
 	}
 	sort.SliceStable(result, func(i, j int) bool { return compareVersions(result[i].ID, result[j].ID) > 0 })
-	c.cacheMu.Lock()
-	c.cached = append([]Release(nil), result...)
-	c.cachedAt = time.Now()
-	c.cacheMu.Unlock()
 	return result, nil
 }
 func distributionFor(platform, architecture string) (string, string, bool) {
