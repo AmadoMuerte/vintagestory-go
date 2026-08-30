@@ -236,3 +236,155 @@ func TestConcurrentGetIsCoalesced(t *testing.T) {
 		t.Fatalf("requests = %d, want 1", requests.Load())
 	}
 }
+
+func TestListSlowBodySucceedsWithinBudget(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		flusher.Flush()
+		_, _ = io.WriteString(w, `{"statuscode":"200","mods":[`)
+		flusher.Flush()
+		time.Sleep(50 * time.Millisecond)
+		_, _ = io.WriteString(w, `{"modid":1,"name":"A","type":"mod"}]}`)
+	}))
+	defer s.Close()
+	c := NewClientWithURL(&http.Client{Timeout: 2 * time.Second}, s.URL)
+	c.SetRetryPolicy(vshttp.RetryPolicy{MaxAttempts: 1})
+	items, err := c.List(context.Background())
+	if err != nil || len(items) != 1 {
+		t.Fatalf("%v %#v", err, items)
+	}
+}
+
+func TestListSlowBodyTimesOutAndRetries(t *testing.T) {
+	var requests atomic.Int32
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		flusher.Flush()
+		_, _ = io.WriteString(w, `{"statuscode":"200","mods":[`)
+		flusher.Flush()
+		<-r.Context().Done()
+	}))
+	defer s.Close()
+	c := NewClientWithURL(&http.Client{Timeout: 80 * time.Millisecond}, s.URL)
+	c.SetRetryPolicy(vshttp.RetryPolicy{MaxAttempts: 2, BaseDelay: time.Millisecond, MaxDelay: 5 * time.Millisecond})
+	_, err := c.List(context.Background())
+	var apiErr *vshttp.APIError
+	if !errors.As(err, &apiErr) || apiErr.Kind != vshttp.KindBodyRead || !apiErr.Retryable || apiErr.StatusCode != 200 {
+		t.Fatalf("%#v", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("root cause lost: %v", err)
+	}
+	if requests.Load() != 2 {
+		t.Fatalf("requests = %d, want 2", requests.Load())
+	}
+}
+
+func TestListRetriesBrokenBodyRead(t *testing.T) {
+	var requests atomic.Int32
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) == 1 {
+			hijackBrokenBody(w)
+			return
+		}
+		_, _ = io.WriteString(w, `{"statuscode":"200","mods":[{"modid":1,"name":"A","type":"mod"}]}`)
+	}))
+	defer s.Close()
+	c := NewClientWithURL(s.Client(), s.URL)
+	c.SetRetryPolicy(vshttp.RetryPolicy{MaxAttempts: 3, BaseDelay: time.Millisecond, MaxDelay: 5 * time.Millisecond})
+	items, err := c.List(context.Background())
+	if err != nil || len(items) != 1 {
+		t.Fatalf("%v %#v", err, items)
+	}
+	if requests.Load() != 2 {
+		t.Fatalf("requests = %d, want 2", requests.Load())
+	}
+}
+
+func TestListRetryExhaustion(t *testing.T) {
+	var requests atomic.Int32
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		hijackBrokenBody(w)
+	}))
+	defer s.Close()
+	c := NewClientWithURL(s.Client(), s.URL)
+	c.SetRetryPolicy(vshttp.RetryPolicy{MaxAttempts: 3, BaseDelay: time.Millisecond, MaxDelay: 5 * time.Millisecond})
+	_, err := c.List(context.Background())
+	var apiErr *vshttp.APIError
+	if !errors.As(err, &apiErr) || apiErr.Kind != vshttp.KindBodyRead {
+		t.Fatalf("%#v", err)
+	}
+	if requests.Load() != 3 {
+		t.Fatalf("requests = %d, want 3", requests.Load())
+	}
+}
+
+func TestListNoRetryOnNotFound(t *testing.T) {
+	var requests atomic.Int32
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		http.NotFound(w, nil)
+	}))
+	defer s.Close()
+	c := NewClientWithURL(s.Client(), s.URL)
+	c.SetRetryPolicy(vshttp.RetryPolicy{MaxAttempts: 5, BaseDelay: time.Millisecond, MaxDelay: 5 * time.Millisecond})
+	_, err := c.List(context.Background())
+	var apiErr *vshttp.APIError
+	if !errors.As(err, &apiErr) || apiErr.Kind != vshttp.KindNotFound {
+		t.Fatalf("%#v", err)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("requests = %d, want 1", requests.Load())
+	}
+}
+
+func TestListCancellationDuringBodyRead(t *testing.T) {
+	var requests atomic.Int32
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		flusher.Flush()
+		_, _ = io.WriteString(w, `{"statuscode":"200","mods":[`)
+		flusher.Flush()
+		<-r.Context().Done()
+	}))
+	defer s.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		cancel()
+	}()
+	c := NewClientWithURL(&http.Client{Timeout: 300 * time.Millisecond}, s.URL)
+	start := time.Now()
+	_, err := c.List(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("%v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("cancel not prompt: %v", elapsed)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("requests = %d, want 1", requests.Load())
+	}
+}
+
+// hijackBrokenBody answers 200 with a declared Content-Length and then drops
+// the connection mid-body, so the client sees an unexpected EOF during the
+// body read.
+func hijackBrokenBody(w http.ResponseWriter) {
+	conn, buf, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		return
+	}
+	_, _ = buf.WriteString("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4096\r\n\r\n{\"statuscode\":\"200\",\"mods\":[")
+	_ = buf.Flush()
+	_ = conn.Close()
+}

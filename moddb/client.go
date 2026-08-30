@@ -22,6 +22,14 @@ const (
 	maxReplyBytes   = 16 << 20
 	catalogCacheTTL = 10 * time.Minute
 	detailsCacheTTL = 30 * time.Minute
+	// requestTimeout bounds a single HTTP attempt, including the full body
+	// read. The catalog is several megabytes of uncompressed JSON that the
+	// server may stream slowly, so the budget must cover a slow body read on
+	// a degraded connection. It applies per attempt: the retry loop issues a
+	// fresh http.Client request (and thus a fresh timeout timer) each round,
+	// while dial, TLS and header stalls still fail fast via the transport
+	// timeouts.
+	requestTimeout = 120 * time.Second
 )
 
 // Client retrieves and locally searches the Vintage Story ModDB catalog.
@@ -46,7 +54,7 @@ type cachedDetails struct {
 // timeouts suitable for unstable networks.
 func NewClient(httpClient *http.Client) *Client {
 	if httpClient == nil {
-		httpClient = vshttp.DefaultClient(30 * time.Second)
+		httpClient = vshttp.DefaultClient(requestTimeout)
 	}
 	return &Client{httpClient: httpClient, baseURL: DefaultBaseURL, retry: vshttp.DefaultRetryPolicy(), details: map[string]cachedDetails{}}
 }
