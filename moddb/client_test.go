@@ -22,7 +22,7 @@ func TestSearchDetailsAndTags(t *testing.T) {
 		case "/mods":
 			_, _ = io.WriteString(w, `{"statuscode":"200","mods":[{"modid":1,"downloads":20,"name":"Server Tools","summary":"Admin helpers","author":"Ada","side":"server","type":"mod","tags":["Utility"],"modidstrs":["servertools"],"lastreleased":"2026-08-01 12:00:00"},{"modid":2,"downloads":200,"name":"Warm Light","summary":"Soft lamps","author":"Bea","side":"client","type":"mod","tags":["Graphics"],"lastreleased":"2026-08-02 12:00:00"}]}`)
 		case "/mod/1":
-			_, _ = io.WriteString(w, `{"statuscode":"200","mod":{"modid":1,"name":"Server Tools","text":"details","author":"Ada","side":"server","releases":[{"releaseid":7,"mainfile":"https://cdn.test/mod.zip","filename":"mod.zip","tags":["1.22.0"],"modversion":"2.0.0"}],"screenshots":["https://cdn.test/a.png"]}}`)
+			_, _ = io.WriteString(w, `{"statuscode":"200","mod":{"modid":1,"name":"Server Tools","text":"details","author":"Ada","side":"server","releases":[{"releaseid":7,"mainfile":"https://cdn.test/mod.zip","filename":"mod.zip","tags":["1.22.0"],"modversion":"2.0.0"}],"screenshots":["https://cdn.test/a.png",{"mainfile":"https://moddbcdn.test/b.png","filename":"b.png"}]}}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -34,8 +34,11 @@ func TestSearchDetailsAndTags(t *testing.T) {
 		t.Fatalf("%v %#v", e, result)
 	}
 	details, e := c.Get(context.Background(), "1")
-	if e != nil || len(details.Releases) != 1 || len(details.Screenshots) != 1 {
+	if e != nil || len(details.Releases) != 1 || len(details.Screenshots) != 2 {
 		t.Fatalf("%v %#v", e, details)
+	}
+	if details.Screenshots[1].URL != "https://moddbcdn.test/b.png" {
+		t.Fatalf("mainfile screenshot URL = %q", details.Screenshots[1].URL)
 	}
 	tags, e := c.ListTags(context.Background())
 	if e != nil || len(tags) != 2 {

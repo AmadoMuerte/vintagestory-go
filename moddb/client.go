@@ -614,7 +614,7 @@ func parseScreenshot(raw json.RawMessage) (Screenshot, bool) {
 	if json.Unmarshal(raw, &object) != nil {
 		return Screenshot{}, false
 	}
-	for _, k := range []string{"url", "file", "filename", "image"} {
+	for _, k := range []string{"mainfile", "url", "file", "filename", "image"} {
 		if v, ok := object[k].(string); ok && strings.HasPrefix(v, "https://") {
 			caption, _ := object["caption"].(string)
 			return Screenshot{v, caption}, true
