@@ -188,8 +188,13 @@ func TestSearchWarningOnPartialEnrichment(t *testing.T) {
 	if result.Warning == nil {
 		t.Fatal("partial failure must be reported via Warning")
 	}
-	if len(result.Items) != 1 || result.Items[0].ID != "1" {
+	// The server-side filter already guarantees compatibility, so failed
+	// detail lookups degrade the enrichment, not the result set.
+	if len(result.Items) != 2 {
 		t.Fatalf("%#v", result.Items)
+	}
+	if len(result.Items[0].GameVersions) != 1 || result.Items[0].GameVersions[0] != "1.22.0" {
+		t.Fatalf("enrichment lost: %#v", result.Items[0])
 	}
 }
 
@@ -387,4 +392,261 @@ func hijackBrokenBody(w http.ResponseWriter) {
 	_, _ = buf.WriteString("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4096\r\n\r\n{\"statuscode\":\"200\",\"mods\":[")
 	_ = buf.Flush()
 	_ = conn.Close()
+}
+
+func TestSearchGameVersionUsesServerFilter(t *testing.T) {
+	var modsRequests atomic.Int32
+	var sawGameVersion atomic.Bool
+	var detailRequests atomic.Int32
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/mods":
+			modsRequests.Add(1)
+			if r.URL.Query().Get("gameversion") == "1.20" {
+				sawGameVersion.Store(true)
+			}
+			_, _ = io.WriteString(w, `{"statuscode":"200","mods":[{"modid":1,"name":"Alpha","type":"mod"},{"modid":2,"name":"Beta","type":"mod"}]}`)
+		case "/mod/1", "/mod/2":
+			detailRequests.Add(1)
+			_, _ = io.WriteString(w, `{"statuscode":"200","mod":{"modid":`+strings.TrimPrefix(r.URL.Path, "/mod/")+`,"name":"A","releases":[{"releaseid":1,"tags":["1.20.7"],"modversion":"2.0.0"}]}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer s.Close()
+	c := NewClientWithURL(s.Client(), s.URL)
+	c.SetRetryPolicy(vshttp.RetryPolicy{MaxAttempts: 1})
+	result, err := c.Search(context.Background(), SearchOptions{GameVersion: "1.20.x", Page: 1, PageSize: 24})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sawGameVersion.Load() {
+		t.Fatal("server filter not used")
+	}
+	if modsRequests.Load() != 1 {
+		t.Fatalf("mods requests = %d, want 1", modsRequests.Load())
+	}
+	if result.TotalItems != 2 || len(result.Items) != 2 {
+		t.Fatalf("%#v", result)
+	}
+	if len(result.Items[0].GameVersions) != 1 || result.Items[0].GameVersions[0] != "1.20.7" {
+		t.Fatalf("page enrichment missing: %#v", result.Items[0])
+	}
+	if detailRequests.Load() != 2 {
+		t.Fatalf("detail requests = %d, want 2", detailRequests.Load())
+	}
+}
+
+func TestSearchGameVersionExactUsesGv(t *testing.T) {
+	var sawGv atomic.Bool
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/mods":
+			if r.URL.Query().Get("gv") == "1.20.7" {
+				sawGv.Store(true)
+			}
+			_, _ = io.WriteString(w, `{"statuscode":"200","mods":[{"modid":1,"name":"A","type":"mod"}]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer s.Close()
+	c := NewClientWithURL(s.Client(), s.URL)
+	c.SetRetryPolicy(vshttp.RetryPolicy{MaxAttempts: 1})
+	if _, err := c.Search(context.Background(), SearchOptions{GameVersion: "1.20.7"}); err != nil {
+		t.Fatal(err)
+	}
+	if !sawGv.Load() {
+		t.Fatal("gv parameter not used")
+	}
+}
+
+func TestSearchGameVersionInvalidFallsBackToCatalog(t *testing.T) {
+	var plainRequests atomic.Int32
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/mods":
+			if len(r.URL.RawQuery) == 0 {
+				plainRequests.Add(1)
+			}
+			_, _ = io.WriteString(w, `{"statuscode":"200","mods":[{"modid":1,"name":"A","type":"mod"}]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer s.Close()
+	c := NewClientWithURL(s.Client(), s.URL)
+	c.SetRetryPolicy(vshttp.RetryPolicy{MaxAttempts: 1})
+	result, err := c.Search(context.Background(), SearchOptions{GameVersion: "garbage!!"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plainRequests.Load() == 0 {
+		t.Fatal("expected fallback to the plain catalog")
+	}
+	if result.TotalItems != 1 {
+		t.Fatalf("%#v", result)
+	}
+}
+
+func TestSearchGameVersionCacheHit(t *testing.T) {
+	var modsRequests atomic.Int32
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/mods":
+			modsRequests.Add(1)
+			_, _ = io.WriteString(w, `{"statuscode":"200","mods":[{"modid":1,"name":"A","type":"mod"}]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer s.Close()
+	c := NewClientWithURL(s.Client(), s.URL)
+	c.SetRetryPolicy(vshttp.RetryPolicy{MaxAttempts: 1})
+	for range 2 {
+		if _, err := c.Search(context.Background(), SearchOptions{GameVersion: "1.20.x"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if modsRequests.Load() != 1 {
+		t.Fatalf("mods requests = %d, want 1", modsRequests.Load())
+	}
+}
+
+func TestSearchGameVersionSingleflight(t *testing.T) {
+	var modsRequests atomic.Int32
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/mods":
+			modsRequests.Add(1)
+			time.Sleep(20 * time.Millisecond)
+			_, _ = io.WriteString(w, `{"statuscode":"200","mods":[{"modid":1,"name":"A","type":"mod"}]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer s.Close()
+	c := NewClientWithURL(s.Client(), s.URL)
+	var wg sync.WaitGroup
+	for range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := c.Search(context.Background(), SearchOptions{GameVersion: "1.20.x"}); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	if modsRequests.Load() != 1 {
+		t.Fatalf("mods requests = %d, want 1", modsRequests.Load())
+	}
+}
+
+func TestSearchGameVersionStaleOnError(t *testing.T) {
+	var fail atomic.Bool
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/mods":
+			if fail.Load() {
+				http.Error(w, "no", 503)
+				return
+			}
+			_, _ = io.WriteString(w, `{"statuscode":"200","mods":[{"modid":1,"name":"A","type":"mod"}]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer s.Close()
+	c := NewClientWithURL(s.Client(), s.URL)
+	c.SetRetryPolicy(vshttp.RetryPolicy{MaxAttempts: 1})
+	if _, err := c.Search(context.Background(), SearchOptions{GameVersion: "1.20.x"}); err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	entry := c.catalogByGV["gameversion=1.20"]
+	entry.at = time.Now().Add(-catalogCacheTTL)
+	c.catalogByGV["gameversion=1.20"] = entry
+	c.mu.Unlock()
+	fail.Store(true)
+	result, err := c.Search(context.Background(), SearchOptions{GameVersion: "1.20.x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Warning == nil || !errors.Is(result.Warning, ErrStale) {
+		t.Fatalf("stale data must be served with ErrStale warning: %v", result.Warning)
+	}
+	if result.TotalItems != 1 {
+		t.Fatalf("%#v", result)
+	}
+}
+
+func TestSearchGameVersionCancellationDuringFetch(t *testing.T) {
+	var requests atomic.Int32
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		flusher.Flush()
+		_, _ = io.WriteString(w, `{"statuscode":"200","mods":[`)
+		flusher.Flush()
+		<-r.Context().Done()
+	}))
+	defer s.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		cancel()
+	}()
+	c := NewClientWithURL(&http.Client{Timeout: 300 * time.Millisecond}, s.URL)
+	start := time.Now()
+	_, err := c.Search(ctx, SearchOptions{GameVersion: "1.20.x"})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("%v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("cancel not prompt: %v", elapsed)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("requests = %d, want 1", requests.Load())
+	}
+}
+
+func TestSearchGameVersionEnrichesOnlyPage(t *testing.T) {
+	var modsRequests atomic.Int32
+	var detailRequests atomic.Int32
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/mods":
+			modsRequests.Add(1)
+			_, _ = io.WriteString(w, `{"statuscode":"200","mods":[{"modid":1,"name":"A","type":"mod"},{"modid":2,"name":"B","type":"mod"},{"modid":3,"name":"C","type":"mod"}]}`)
+		default:
+			detailRequests.Add(1)
+			_, _ = io.WriteString(w, `{"statuscode":"200","mod":{"modid":`+strings.TrimPrefix(r.URL.Path, "/mod/")+`,"name":"A","releases":[{"releaseid":1,"tags":["1.20.7"],"modversion":"1.0.0"}]}}`)
+		}
+	}))
+	defer s.Close()
+	c := NewClientWithURL(s.Client(), s.URL)
+	c.SetRetryPolicy(vshttp.RetryPolicy{MaxAttempts: 1})
+	result, err := c.Search(context.Background(), SearchOptions{GameVersion: "1.20.x", Page: 1, PageSize: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if modsRequests.Load() != 1 {
+		t.Fatalf("mods requests = %d, want 1", modsRequests.Load())
+	}
+	if detailRequests.Load() != 2 {
+		t.Fatalf("detail requests = %d, want 2 (page size)", detailRequests.Load())
+	}
+	if len(result.Items) != 2 {
+		t.Fatalf("%#v", result.Items)
+	}
 }

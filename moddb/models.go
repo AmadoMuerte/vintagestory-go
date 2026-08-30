@@ -47,7 +47,11 @@ type ModDetails struct {
 	WebsiteURL, SourceURL, License string
 }
 
-// SearchOptions controls locally applied ModDB catalog filtering and paging.
+// SearchOptions controls ModDB catalog filtering and paging. Text, side,
+// updated-after and tag filters are applied locally; a non-empty
+// GameVersion is resolved server-side through the gameversion/gv query
+// parameter, so the full catalog is not downloaded for version-filtered
+// searches.
 type SearchOptions struct {
 	Text, GameVersion, Sort string
 	Side                    Side

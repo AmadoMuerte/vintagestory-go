@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -15,6 +16,13 @@ import (
 
 	"github.com/AmadoMuerte/vintagestory-go/vshttp"
 	"golang.org/x/sync/singleflight"
+)
+
+// Server-side query parameter formats accepted by the ModDB v1 list endpoint
+// (mirrored from the vsmoddb server, lib/version.php).
+var (
+	majorMinorRE = regexp.MustCompile(`^\d+\.\d+$`)
+	semverRE     = regexp.MustCompile(`^\d+\.\d+\.\d+(?:-(?:dev|pre|rc)\.\d+)?$`)
 )
 
 const (
@@ -39,15 +47,20 @@ type Client struct {
 	baseURL    string
 	retry      vshttp.RetryPolicy
 
-	mu        sync.RWMutex
-	catalog   []Mod
-	catalogAt time.Time
-	details   map[string]cachedDetails
-	inflight  singleflight.Group
+	mu          sync.RWMutex
+	catalog     []Mod
+	catalogAt   time.Time
+	catalogByGV map[string]cachedCatalog
+	details     map[string]cachedDetails
+	inflight    singleflight.Group
 }
 type cachedDetails struct {
 	value     ModDetails
 	fetchedAt time.Time
+}
+type cachedCatalog struct {
+	items []Mod
+	at    time.Time
 }
 
 // NewClient creates a ModDB client. A nil client uses bounded default
@@ -56,7 +69,7 @@ func NewClient(httpClient *http.Client) *Client {
 	if httpClient == nil {
 		httpClient = vshttp.DefaultClient(requestTimeout)
 	}
-	return &Client{httpClient: httpClient, baseURL: DefaultBaseURL, retry: vshttp.DefaultRetryPolicy(), details: map[string]cachedDetails{}}
+	return &Client{httpClient: httpClient, baseURL: DefaultBaseURL, retry: vshttp.DefaultRetryPolicy(), details: map[string]cachedDetails{}, catalogByGV: map[string]cachedCatalog{}}
 }
 
 // NewClientWithURL creates a client against an explicit API base URL.
@@ -118,12 +131,26 @@ func (c *Client) List(ctx context.Context) ([]Mod, error) {
 	return append([]Mod(nil), items...), e
 }
 
-// Search filters, sorts, and pages the catalog locally. Game-version
-// filtering loads details for a bounded candidate set. Partial failures of
-// those detail lookups are reported via SearchResult.Warning instead of
-// silently dropping results.
+// Search filters, sorts, and pages the catalog locally. When a game-version
+// filter is set, the catalog is fetched server-side with the gameversion or
+// gv query parameter instead of the full list; only the returned page is
+// then enriched with version details. Partial failures of those detail
+// lookups are reported via SearchResult.Warning instead of silently
+// dropping results.
 func (c *Client) Search(ctx context.Context, q SearchOptions) (SearchResult, error) {
-	items, err := c.list(ctx)
+	param := ""
+	if q.GameVersion != "" {
+		if name, value, ok := gameVersionParam(q.GameVersion); ok {
+			param = name + "=" + url.QueryEscape(value)
+		}
+	}
+	var items []Mod
+	var err error
+	if param != "" {
+		items, err = c.listForGameVersion(ctx, param)
+	} else {
+		items, err = c.list(ctx)
+	}
 	if err != nil && !errors.Is(err, ErrStale) {
 		return SearchResult{}, err
 	}
@@ -146,16 +173,6 @@ func (c *Client) Search(ctx context.Context, q SearchOptions) (SearchResult, err
 		filtered = append(filtered, m)
 	}
 	sortMods(filtered, q.Sort, text != "")
-	if q.GameVersion != "" {
-		enriched, enrichErr := c.enrichCompatible(ctx, filtered, q.GameVersion, q.PageSize)
-		if enrichErr != nil && errors.Is(enrichErr, context.Canceled) {
-			return SearchResult{}, enrichErr
-		}
-		if enrichErr != nil && warning == nil {
-			warning = enrichErr
-		}
-		filtered = enriched
-	}
 	page := q.Page
 	if page < 1 {
 		page = 1
@@ -173,7 +190,18 @@ func (c *Client) Search(ctx context.Context, q SearchOptions) (SearchResult, err
 	if end > total {
 		end = total
 	}
-	return SearchResult{Items: append([]Mod(nil), filtered[start:end]...), Page: page, PageSize: size, TotalItems: total, TotalPages: (total + size - 1) / size, HasNext: end < total, Warning: warning}, nil
+	pageItems := append([]Mod(nil), filtered[start:end]...)
+	if param != "" {
+		enriched, enrichErr := c.enrichPage(ctx, pageItems)
+		if enrichErr != nil && errors.Is(enrichErr, context.Canceled) {
+			return SearchResult{}, enrichErr
+		}
+		if enrichErr != nil && warning == nil {
+			warning = enrichErr
+		}
+		pageItems = enriched
+	}
+	return SearchResult{Items: pageItems, Page: page, PageSize: size, TotalItems: total, TotalPages: (total + size - 1) / size, HasNext: end < total, Warning: warning}, nil
 }
 
 // ListTags returns case-insensitive catalog tags with usage counts. The
@@ -239,14 +267,74 @@ func (c *Client) list(ctx context.Context) ([]Mod, error) {
 	}
 }
 
+// listForGameVersion returns the catalog filtered server-side by a game
+// version query parameter, sharing the same caching, singleflight and
+// stale-if-error semantics as list. On refresh failure a previously cached
+// filtered catalog is returned together with an error wrapping ErrStale.
+func (c *Client) listForGameVersion(ctx context.Context, param string) ([]Mod, error) {
+	c.mu.RLock()
+	var stale []Mod
+	if entry, ok := c.catalogByGV[param]; ok {
+		if time.Since(entry.at) < catalogCacheTTL {
+			c.mu.RUnlock()
+			return append([]Mod(nil), entry.items...), nil
+		}
+		stale = append([]Mod(nil), entry.items...)
+	}
+	c.mu.RUnlock()
+
+	op := "moddb: list catalog (" + param + ")"
+	endpoint := c.baseURL + "/mods?" + param
+	result := c.inflight.DoChan("catalog:gv:"+param, func() (any, error) {
+		// Detach from the caller's cancellation like list does: the shared
+		// fetch must survive the first caller leaving so all waiters get a
+		// result and the cache still gets populated. Bounded by client
+		// timeouts.
+		items, err := c.fetchMods(context.WithoutCancel(ctx), op, endpoint)
+		if err != nil && len(stale) > 0 {
+			return stale, fmt.Errorf("%w: %w", ErrStale, err)
+		}
+		if err == nil {
+			c.mu.Lock()
+			c.catalogByGV[param] = cachedCatalog{items: append([]Mod(nil), items...), at: time.Now()}
+			c.mu.Unlock()
+		}
+		return items, err
+	})
+	select {
+	case r := <-result:
+		if r.Err != nil {
+			items, _ := r.Val.([]Mod)
+			return items, r.Err
+		}
+		items, _ := r.Val.([]Mod)
+		return append([]Mod(nil), items...), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 func (c *Client) fetchCatalog(ctx context.Context) ([]Mod, error) {
-	endpoint := c.baseURL + "/mods"
+	items, err := c.fetchMods(ctx, "moddb: list catalog", c.baseURL+"/mods")
+	if err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	c.catalog = append([]Mod(nil), items...)
+	c.catalogAt = time.Now()
+	c.mu.Unlock()
+	return items, nil
+}
+
+// fetchMods fetches and parses a mod list response. It never touches the
+// caches; callers own cache writes.
+func (c *Client) fetchMods(ctx context.Context, op, endpoint string) ([]Mod, error) {
 	var r modsResponse
-	if e := c.getJSON(ctx, "moddb: list catalog", endpoint, &r); e != nil {
+	if e := c.getJSON(ctx, op, endpoint, &r); e != nil {
 		return nil, e
 	}
 	if r.StatusCode != "200" {
-		return nil, legacy(apiStatusError("moddb: list catalog", endpoint, r.StatusCode))
+		return nil, legacy(apiStatusError(op, endpoint, r.StatusCode))
 	}
 	out := make([]Mod, 0, len(r.Mods))
 	for _, x := range r.Mods {
@@ -266,10 +354,6 @@ func (c *Client) fetchCatalog(ctx context.Context) ([]Mod, error) {
 		}
 		out = append(out, Mod{ID: strconv.FormatInt(x.ModID, 10), Slug: slug, Name: x.Name, AuthorName: x.Author, Summary: x.Summary, ImageURL: image, Side: normalizeSide(x.Side), Downloads: x.Downloads, UpdatedAt: parseDate(x.LastReleased), Tags: nonEmpty(x.Tags), ModIDStrings: nonEmpty(x.ModIDStrings), GameVersions: []string{}})
 	}
-	c.mu.Lock()
-	c.catalog = append([]Mod(nil), out...)
-	c.catalogAt = time.Now()
-	c.mu.Unlock()
 	return out, nil
 }
 
@@ -356,19 +440,32 @@ func mapDetails(x apiDetail) ModDetails {
 	return d
 }
 
-// enrichCompatible resolves game-version support for up to six pages of
-// candidates. Individual lookup failures no longer vanish: the first
-// failure is returned so the caller can surface a partial-results warning.
-func (c *Client) enrichCompatible(ctx context.Context, items []Mod, game string, size int) ([]Mod, error) {
-	if size < 1 {
-		size = 24
+// gameVersionParam maps a game-version filter to the ModDB v1 list query
+// parameter. Series or major versions ("1.20.x", "1.20") map to the
+// gameversion parameter, exact versions ("1.20.7", "1.20.7-rc.1") map to gv.
+// The accepted formats mirror the server-side parsers in vsmoddb
+// (lib/version.php). Unrecognized input is rejected so callers fall back to
+// the plain full catalog.
+func gameVersionParam(raw string) (name, value string, ok bool) {
+	v := strings.TrimSpace(raw)
+	series := strings.TrimSuffix(v, ".x")
+	if majorMinorRE.MatchString(series) {
+		return "gameversion", series, true
 	}
-	limit := size * 6
-	if limit > 180 {
-		limit = 180
+	if semverRE.MatchString(v) {
+		return "gv", v, true
 	}
-	if limit > len(items) {
-		limit = len(items)
+	return "", "", false
+}
+
+// enrichPage fills GameVersions and LatestVersion for the mods of one result
+// page from their (cached) details. The list payload carries no per-mod game
+// version data, so a server-filtered search annotates just the visible page.
+// Lookup failures degrade to an error that the caller surfaces as a Warning
+// instead of failing the search.
+func (c *Client) enrichPage(ctx context.Context, items []Mod) ([]Mod, error) {
+	if len(items) == 0 {
+		return items, nil
 	}
 	type result struct {
 		i   int
@@ -376,10 +473,10 @@ func (c *Client) enrichCompatible(ctx context.Context, items []Mod, game string,
 		err error
 	}
 	jobs := make(chan int)
-	results := make(chan result, limit)
+	results := make(chan result, len(items))
 	workers := 8
-	if workers > limit {
-		workers = limit
+	if workers > len(items) {
+		workers = len(items)
 	}
 	var wg sync.WaitGroup
 	for range workers {
@@ -393,7 +490,7 @@ func (c *Client) enrichCompatible(ctx context.Context, items []Mod, game string,
 		}()
 	}
 	go func() {
-		for i := 0; i < limit; i++ {
+		for i := range items {
 			select {
 			case jobs <- i:
 			case <-ctx.Done():
@@ -407,7 +504,7 @@ func (c *Client) enrichCompatible(ctx context.Context, items []Mod, game string,
 		wg.Wait()
 		close(results)
 	}()
-	by := map[int]ModDetails{}
+	out := append([]Mod(nil), items...)
 	var firstErr error
 	failures := 0
 	for x := range results {
@@ -418,21 +515,14 @@ func (c *Client) enrichCompatible(ctx context.Context, items []Mod, game string,
 			}
 			continue
 		}
-		by[x.i] = x.d
+		out[x.i].GameVersions = append([]string(nil), x.d.GameVersions...)
+		out[x.i].LatestVersion = x.d.LatestVersion
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	out := []Mod{}
-	for i := 0; i < limit; i++ {
-		if d, ok := by[i]; ok && supportsVersion(d.GameVersions, game) {
-			m := d.Mod
-			m.Summary = items[i].Summary
-			out = append(out, m)
-		}
-	}
 	if firstErr != nil {
-		return out, fmt.Errorf("moddb: game version enrichment: %d of %d lookups failed, first failure: %w", failures, limit, firstErr)
+		return out, fmt.Errorf("moddb: game version enrichment: %d of %d lookups failed, first failure: %w", failures, len(items), firstErr)
 	}
 	return out, nil
 }
@@ -514,16 +604,6 @@ func releaseType(v string) string {
 		return "beta"
 	}
 	return "stable"
-}
-func supportsVersion(v []string, requested string) bool {
-	requested = strings.TrimSpace(requested)
-	series := strings.TrimSuffix(requested, ".x")
-	for _, x := range v {
-		if x == requested || (series != "" && (x == series || strings.HasPrefix(x, series+"."))) {
-			return true
-		}
-	}
-	return false
 }
 func parseScreenshot(raw json.RawMessage) (Screenshot, bool) {
 	var direct string
