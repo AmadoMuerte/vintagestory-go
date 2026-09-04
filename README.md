@@ -30,6 +30,8 @@ list, err := client.List(ctx)
 for _, server := range list {
 	fmt.Println(server.Name, server.Address)
 }
+	details, err := client.Get(ctx, list[0].ID)
+	fmt.Println(details.FullDescription, details.BannerURL, len(details.Mods))
 
 posts, err := news.NewClient(nil, "MyApp/1.0").List(ctx)
 ```

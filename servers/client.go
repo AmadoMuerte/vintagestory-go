@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
+	"path"
 	"sync"
 	"time"
 
@@ -62,9 +64,70 @@ func (c *Client) List(ctx context.Context) ([]Server, error) {
 	}
 
 	const op = "servers: list catalog"
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint, nil)
+	root, err := c.fetchHTML(ctx, c.endpoint, op)
 	if err != nil {
-		return nil, legacy(&vshttp.APIError{Operation: op, Method: http.MethodGet, Endpoint: c.endpoint, Kind: vshttp.KindValidation, Cause: err})
+		return nil, err
+	}
+	servers := parseServers(root)
+	if len(servers) == 0 {
+		return nil, legacy(&vshttp.APIError{Operation: op, Method: http.MethodGet, Endpoint: c.endpoint, Kind: vshttp.KindInvalidResponse, Cause: fmt.Errorf("catalog contained no server listings")})
+	}
+	for i := range servers {
+		resolveURLs(&servers[i], c.endpoint)
+	}
+	c.servers = append([]Server(nil), servers...)
+	c.fetchedAt = time.Now()
+	return append([]Server(nil), servers...), nil
+}
+
+// Get returns the full public details for a server.
+func (c *Client) Get(ctx context.Context, id string) (Server, error) {
+	if id == "" {
+		return Server{}, legacy(&vshttp.APIError{Operation: "servers: get detail", Method: http.MethodGet, Endpoint: c.endpoint, Kind: vshttp.KindValidation, Cause: fmt.Errorf("server ID is empty")})
+	}
+	endpoint, err := detailURL(c.endpoint, id)
+	if err != nil {
+		return Server{}, legacy(&vshttp.APIError{Operation: "servers: get detail", Method: http.MethodGet, Endpoint: c.endpoint, Kind: vshttp.KindValidation, Cause: err})
+	}
+	root, err := c.fetchHTML(ctx, endpoint, "servers: get detail")
+	if err != nil {
+		return Server{}, err
+	}
+	server, ok := parseServerDetail(root)
+	if !ok {
+		return Server{}, legacy(&vshttp.APIError{Operation: "servers: get detail", Method: http.MethodGet, Endpoint: endpoint, Kind: vshttp.KindInvalidResponse, Cause: fmt.Errorf("server detail page contained no server")})
+	}
+	server.URL = endpoint
+	resolveURLs(&server, endpoint)
+	return server, nil
+}
+
+func resolveURLs(server *Server, base string) {
+	baseURL, err := url.Parse(base)
+	if err != nil {
+		return
+	}
+	resolve := func(value *string) {
+		if *value == "" {
+			return
+		}
+		if parsed, err := url.Parse(*value); err == nil {
+			*value = baseURL.ResolveReference(parsed).String()
+		}
+	}
+	resolve(&server.URL)
+	resolve(&server.ImageURL)
+	resolve(&server.BannerURL)
+	resolve(&server.OperatorURL)
+	for i := range server.Mods {
+		resolve(&server.Mods[i].URL)
+	}
+}
+
+func (c *Client) fetchHTML(ctx context.Context, endpoint, op string) (*html.Node, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, legacy(&vshttp.APIError{Operation: op, Method: http.MethodGet, Endpoint: endpoint, Kind: vshttp.KindValidation, Cause: err})
 	}
 	response, body, err := vshttp.Do(ctx, c.httpClient, c.retry, op, request, maxResponseBytes)
 	if err != nil {
@@ -73,16 +136,20 @@ func (c *Client) List(ctx context.Context) ([]Server, error) {
 	if err := vshttp.CheckStatus(op, request, response); err != nil {
 		return nil, legacy(err)
 	}
-
 	root, err := html.Parse(bytes.NewReader(body))
 	if err != nil {
-		return nil, legacy(&vshttp.APIError{Operation: op, Method: http.MethodGet, Endpoint: c.endpoint, StatusCode: response.StatusCode, ContentType: response.Header.Get("Content-Type"), Kind: vshttp.KindInvalidResponse, Cause: fmt.Errorf("parse catalog HTML: %w", err)})
+		return nil, legacy(&vshttp.APIError{Operation: op, Method: http.MethodGet, Endpoint: endpoint, StatusCode: response.StatusCode, ContentType: response.Header.Get("Content-Type"), Kind: vshttp.KindInvalidResponse, Cause: fmt.Errorf("parse HTML: %w", err)})
 	}
-	servers := parseServers(root)
-	if len(servers) == 0 {
-		return nil, legacy(&vshttp.APIError{Operation: op, Method: http.MethodGet, Endpoint: c.endpoint, StatusCode: response.StatusCode, ContentType: response.Header.Get("Content-Type"), Kind: vshttp.KindInvalidResponse, Cause: fmt.Errorf("catalog contained no server listings")})
+	return root, nil
+}
+
+func detailURL(endpoint, id string) (string, error) {
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return "", err
 	}
-	c.servers = append([]Server(nil), servers...)
-	c.fetchedAt = time.Now()
-	return append([]Server(nil), servers...), nil
+	parsed.Path = path.Join(parsed.Path, "s", url.PathEscape(id))
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String(), nil
 }

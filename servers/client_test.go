@@ -133,3 +133,19 @@ func TestOversizedCatalogIsExplicit(t *testing.T) {
 		t.Fatalf("%#v", err)
 	}
 }
+
+func TestGetServerDetails(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/s/42" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = io.WriteString(w, `<main class="server" data-sid="42"><h1>Detailed</h1><div class="text-section"><p>Full description</p></div></main>`)
+	}))
+	defer server.Close()
+
+	got, err := NewClientWithURL(server.Client(), server.URL).Get(context.Background(), "42")
+	if err != nil || got.ID != "42" || got.Name != "Detailed" || got.FullDescription != "Full description" || got.URL != server.URL+"/s/42" {
+		t.Fatalf("got %#v, err=%v", got, err)
+	}
+}

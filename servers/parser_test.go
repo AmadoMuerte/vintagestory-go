@@ -79,3 +79,32 @@ func TestParseServersCurrentCatalog(t *testing.T) {
 		t.Fatalf("unexpected current incomplete server: %#v", got)
 	}
 }
+
+func TestParseServerDetail(t *testing.T) {
+	root, err := html.Parse(strings.NewReader(`
+<aside><div id="server-info">
+  <img alt="Thumbnail" src="/files/thumb.png">
+  <span>Players:</span><span>12 / 40</span>
+  <span>Game Version:</span><span>1.22.7</span>
+  <span>Location:</span><span>United States</span>
+  <span>Languages:</span><span><span class="tag" title="English">en</span></span>
+  <span>Operated By:</span><a href="/u/operator">Owner</a>
+  <a href="vintagestoryjoin://example.test:42420">Join</a>
+</div></aside>
+<main class="server" data-sid="42">
+  <h1>Example Server</h1>
+  <img class="banner" alt="Banner" src="/files/banner.png">
+  <div class="text-section"><p>Hello <strong>world</strong>.</p></div>
+  <ul class="tag-list"><li><a class="external" href="//mods.vintagestory.at/show/mod/1">Example Mod@1.2.3</a></li></ul>
+</main>`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, ok := parseServerDetail(root)
+	if !ok || server.ID != "42" || server.Name != "Example Server" || server.Players != 12 || server.MaxPlayers != 40 || server.GameVersion != "1.22.7" || server.Location != "United States" || len(server.Languages) != 1 || server.Languages[0] != "English" || server.Operator != "Owner" || server.Address != "example.test:42420" || server.ImageURL != "/files/thumb.png" || server.BannerURL != "/files/banner.png" || len(server.Mods) != 1 || server.Mods[0].Version != "1.2.3" || server.FullDescription != "Hello world ." {
+		t.Fatalf("unexpected detail: %#v", server)
+	}
+	if !strings.Contains(server.DescriptionHTML, "<strong>world</strong>") {
+		t.Fatalf("description HTML lost formatting: %q", server.DescriptionHTML)
+	}
+}
