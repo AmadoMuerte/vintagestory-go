@@ -115,21 +115,14 @@ func analyzeMod(ctx context.Context, m ModInstall, game string, installed map[st
 }
 func selectTargetVersion(info ModInfo, installed string) (ModVersion, bool) {
 	if info.LatestVersion != "" {
-		if VersionEquals(info.LatestVersion, installed) {
-			return ModVersion{}, false
-		}
-		if v, ok := findVersion(info.Versions, info.LatestVersion); ok {
+		if v, ok := findVersion(info.Versions, info.LatestVersion); ok && CompareVersions(v.Version, installed) > 0 {
 			return v, true
 		}
 	}
-	if v, ok := newestVersion(info.Versions, true); ok {
-		if VersionEquals(v.Version, installed) {
-			return ModVersion{}, false
-		}
+	if v, ok := newestVersion(info.Versions, installed, true); ok {
 		return v, true
 	}
-	v, ok := newestVersion(info.Versions, false)
-	return v, ok && !VersionEquals(v.Version, installed)
+	return newestVersion(info.Versions, installed, false)
 }
 func findVersion(v []ModVersion, version string) (ModVersion, bool) {
 	for _, x := range v {
@@ -139,11 +132,11 @@ func findVersion(v []ModVersion, version string) (ModVersion, bool) {
 	}
 	return ModVersion{}, false
 }
-func newestVersion(v []ModVersion, stable bool) (ModVersion, bool) {
+func newestVersion(v []ModVersion, installed string, stable bool) (ModVersion, bool) {
 	var best ModVersion
 	found := false
 	for _, x := range v {
-		if stable && !isStableRelease(x.ReleaseType) {
+		if CompareVersions(x.Version, installed) <= 0 || (stable && !isStableRelease(x.ReleaseType)) {
 			continue
 		}
 		if !found || CompareVersions(x.Version, best.Version) > 0 {
