@@ -115,14 +115,15 @@ func analyzeMod(ctx context.Context, m ModInstall, game string, installed map[st
 }
 func selectTargetVersion(info ModInfo, installed string) (ModVersion, bool) {
 	if info.LatestVersion != "" {
-		if v, ok := findVersion(info.Versions, info.LatestVersion); ok && CompareVersions(v.Version, installed) > 0 {
-			return v, true
+		if v, ok := findVersion(info.Versions, info.LatestVersion); ok {
+			if IsUpgradeTarget(installed, v) {
+				return v, true
+			}
+		} else if IsUpgradeTarget(installed, ModVersion{Version: info.LatestVersion}) {
+			return ModVersion{Version: info.LatestVersion}, true
 		}
 	}
-	if v, ok := newestVersion(info.Versions, installed, true); ok {
-		return v, true
-	}
-	return newestVersion(info.Versions, installed, false)
+	return newestVersion(info.Versions, installed)
 }
 func findVersion(v []ModVersion, version string) (ModVersion, bool) {
 	for _, x := range v {
@@ -132,15 +133,63 @@ func findVersion(v []ModVersion, version string) (ModVersion, bool) {
 	}
 	return ModVersion{}, false
 }
-func newestVersion(v []ModVersion, installed string, stable bool) (ModVersion, bool) {
+
+// IsUpgradeTarget reports whether target is a genuine update for installed.
+// It respects release channels: a stable installation is not offered a
+// prerelease target by default, while a prerelease installation may advance to
+// a newer prerelease or to a newer stable release. Only strictly newer
+// versions qualify. The installed release type is derived from its semantic
+// version; target prerelease status comes from ReleaseType when it is
+// provided and otherwise from the semantic version.
+func IsUpgradeTarget(installed string, target ModVersion) bool {
+	if installed == "" || target.Version == "" {
+		return false
+	}
+	if CompareVersions(target.Version, installed) <= 0 {
+		return false
+	}
+	if isPrereleaseVersion(installed) {
+		return true
+	}
+	return !isPrereleaseTarget(target)
+}
+
+func isPrereleaseTarget(target ModVersion) bool {
+	if !isStableRelease(target.ReleaseType) {
+		return true
+	}
+	return isPrereleaseVersion(target.Version)
+}
+
+func isPrereleaseVersion(version string) bool {
+	normalized := normalizeSemver(version)
+	if normalized == "" {
+		return false
+	}
+	return semver.Prerelease(normalized) != ""
+}
+
+func newestVersion(v []ModVersion, installed string) (ModVersion, bool) {
 	var best ModVersion
 	found := false
 	for _, x := range v {
-		if CompareVersions(x.Version, installed) <= 0 || (stable && !isStableRelease(x.ReleaseType)) {
+		if !IsUpgradeTarget(installed, x) {
 			continue
 		}
-		if !found || CompareVersions(x.Version, best.Version) > 0 {
+		if !found {
 			best, found = x, true
+			continue
+		}
+		bestStable := isStableRelease(best.ReleaseType)
+		candidateStable := isStableRelease(x.ReleaseType)
+		if candidateStable != bestStable {
+			if candidateStable {
+				best = x
+			}
+			continue
+		}
+		if CompareVersions(x.Version, best.Version) > 0 {
+			best = x
 		}
 	}
 	return best, found
