@@ -89,3 +89,5 @@ Partial game-version enrichment failures are also surfaced through
 `SearchResult.Warning` instead of vanishing.
 
 Licensed under GPL-3.0-only, compatible with the extracted source.
+
+More projects: [amadomuerte.ru](https://amadomuerte.ru).
