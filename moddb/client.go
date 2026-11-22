@@ -88,6 +88,7 @@ type modsResponse struct {
 }
 type apiSummary struct {
 	ModID                                           int64 `json:"modid"`
+	AssetID                                         int64 `json:"assetid"`
 	Downloads                                       int64 `json:"downloads"`
 	Name, Summary, Author, Side, Type, LastReleased string
 	ModIDStrings                                    []string `json:"modidstrs"`
@@ -348,18 +349,23 @@ func (c *Client) fetchMods(ctx context.Context, op, endpoint string) ([]Mod, err
 		if slug == "" && len(x.ModIDStrings) > 0 {
 			slug = x.ModIDStrings[0]
 		}
+		assetID := ""
+		if x.AssetID != 0 {
+			assetID = strconv.FormatInt(x.AssetID, 10)
+		}
 		image := ""
 		if x.Logo != nil {
 			image = *x.Logo
 		}
-		out = append(out, Mod{ID: strconv.FormatInt(x.ModID, 10), Slug: slug, Name: x.Name, AuthorName: x.Author, Summary: x.Summary, ImageURL: image, Side: normalizeSide(x.Side), Downloads: x.Downloads, UpdatedAt: parseDate(x.LastReleased), Tags: nonEmpty(x.Tags), ModIDStrings: nonEmpty(x.ModIDStrings), GameVersions: []string{}})
+		out = append(out, Mod{ID: strconv.FormatInt(x.ModID, 10), AssetID: assetID, Slug: slug, Name: x.Name, AuthorName: x.Author, Summary: x.Summary, ImageURL: image, Side: normalizeSide(x.Side), Downloads: x.Downloads, UpdatedAt: parseDate(x.LastReleased), Tags: nonEmpty(x.Tags), ModIDStrings: nonEmpty(x.ModIDStrings), GameVersions: []string{}})
 	}
 	return out, nil
 }
 
-// Get returns detailed metadata for a numeric ID or ModDB slug. Results are
-// cached for thirty minutes and concurrent calls for the same mod share a
-// single upstream request.
+// Get returns detailed metadata for a numeric modid, a numeric asset id
+// (used by /show/mod/<id> web URLs), or a ModDB slug. Results are cached for
+// thirty minutes and concurrent calls for the same mod share a single
+// upstream request.
 func (c *Client) Get(ctx context.Context, id string) (ModDetails, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
@@ -387,16 +393,26 @@ func (c *Client) Get(ctx context.Context, id string) (ModDetails, error) {
 }
 
 func (c *Client) fetchDetails(ctx context.Context, id string) (ModDetails, error) {
-	endpoint := c.baseURL + "/mod/" + url.PathEscape(id)
-	var r modResponse
-	if e := c.getJSON(ctx, "moddb: get mod details", endpoint, &r); e != nil {
+	r, e := c.getMod(ctx, id)
+	if e != nil {
 		return ModDetails{}, e
+	}
+	// Web URLs use the numeric asset id (/show/mod/<assetid>) but the details
+	// endpoint only accepts the modid or slug, so resolve asset ids through
+	// the cached catalog.
+	if (r.StatusCode != "200" || r.Mod.ModID == 0) && isDigits(id) {
+		if resolved, resolveErr := c.resolveAssetID(ctx, id); resolveErr == nil && resolved != "" && resolved != id {
+			r, e = c.getMod(ctx, resolved)
+			if e != nil {
+				return ModDetails{}, e
+			}
+		}
 	}
 	if r.StatusCode != "200" || r.Mod.ModID == 0 {
 		return ModDetails{}, &vshttp.APIError{
 			Operation: "moddb: get mod details",
 			Method:    "GET",
-			Endpoint:  endpoint,
+			Endpoint:  c.baseURL + "/mod/" + url.PathEscape(id),
 			Kind:      vshttp.KindNotFound,
 			Legacy:    ErrNotFound,
 			Cause:     fmt.Errorf("moddb API returned statuscode %q", r.StatusCode),
@@ -412,6 +428,36 @@ func (c *Client) fetchDetails(ctx context.Context, id string) (ModDetails, error
 	}
 	c.mu.Unlock()
 	return d, nil
+}
+
+func (c *Client) getMod(ctx context.Context, id string) (modResponse, error) {
+	var r modResponse
+	e := c.getJSON(ctx, "moddb: get mod details", c.baseURL+"/mod/"+url.PathEscape(id), &r)
+	return r, e
+}
+
+// resolveAssetID maps the numeric asset id used by /show/mod/<id> web URLs
+// to the modid the details endpoint accepts, using the cached catalog.
+func (c *Client) resolveAssetID(ctx context.Context, id string) (string, error) {
+	items, err := c.list(ctx)
+	if err != nil && len(items) == 0 {
+		return "", err
+	}
+	for _, item := range items {
+		if item.AssetID == id {
+			return item.ID, nil
+		}
+	}
+	return "", nil
+}
+
+func isDigits(s string) bool {
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return len(s) > 0
 }
 func mapDetails(x apiDetail) ModDetails {
 	releases := make([]Release, 0, len(x.Releases))
