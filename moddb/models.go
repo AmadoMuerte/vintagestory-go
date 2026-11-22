@@ -12,13 +12,14 @@ const (
 	SideUnknown Side = "unknown"
 )
 
-// Mod is a ModDB catalog entry.
+// Mod is a ModDB catalog entry. AssetID is the numeric id used by
+// /show/mod/<id> web URLs; it is empty when the catalog omits it.
 type Mod struct {
-	ID, Slug, Name, AuthorName, Summary, ImageURL, LatestVersion string
-	Side                                                         Side
-	GameVersions, ModIDStrings, Tags                             []string
-	Downloads                                                    int64
-	CreatedAt, UpdatedAt                                         *time.Time
+	ID, AssetID, Slug, Name, AuthorName, Summary, ImageURL, LatestVersion string
+	Side                                                                  Side
+	GameVersions, ModIDStrings, Tags                                      []string
+	Downloads                                                             int64
+	CreatedAt, UpdatedAt                                                  *time.Time
 }
 type Screenshot struct{ URL, Caption string }
 

@@ -216,6 +216,46 @@ func TestGetNotFoundKeepsRootCause(t *testing.T) {
 	}
 }
 
+func TestGetResolvesAssetID(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/mods":
+			_, _ = io.WriteString(w, `{"statuscode":"200","mods":[{"modid":9227,"assetid":53436,"name":"Frontier's Map","author":"JeanPierre","side":"both","type":"mod","lastreleased":"2026-01-01 00:00:00"}]}`)
+		case "/mod/9227":
+			_, _ = io.WriteString(w, `{"statuscode":"200","mod":{"modid":9227,"name":"Frontier's Map","text":"details","author":"JeanPierre","side":"both"}}`)
+		default:
+			_, _ = io.WriteString(w, `{"statuscode":"404","mod":null}`)
+		}
+	}))
+	defer s.Close()
+	c := NewClientWithURL(s.Client(), s.URL)
+	d, err := c.Get(context.Background(), "53436")
+	if err != nil || d.ID != "9227" || d.Name != "Frontier's Map" {
+		t.Fatalf("%v %#v", err, d)
+	}
+	items, err := c.List(context.Background())
+	if err != nil || len(items) != 1 || items[0].AssetID != "53436" {
+		t.Fatalf("%v %#v", err, items)
+	}
+}
+
+func TestGetUnknownAssetIDStaysNotFound(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/mods" {
+			_, _ = io.WriteString(w, `{"statuscode":"200","mods":[{"modid":9227,"assetid":53436,"name":"Frontier's Map","author":"JeanPierre","side":"both","type":"mod","lastreleased":"2026-01-01 00:00:00"}]}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"statuscode":"404","mod":null}`)
+	}))
+	defer s.Close()
+	_, err := NewClientWithURL(s.Client(), s.URL).Get(context.Background(), "12345")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("%v", err)
+	}
+}
+
 func TestConcurrentGetIsCoalesced(t *testing.T) {
 	var requests atomic.Int32
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
